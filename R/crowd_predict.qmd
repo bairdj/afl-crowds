@@ -1,0 +1,188 @@
+---
+title: AFL crowd prediction
+author: James Baird
+format:
+  html:
+    df-print: kable
+---
+```{r setup, include=FALSE}
+library(dplyr)
+library(fitzRoy)
+library(readr)
+library(lubridate)
+library(purrr)
+```
+
+
+# Introduction
+
+The purpose of this work is to predict the attendance at AFL matches. This will consider features
+that may be predictive of attendance, and will use a selection of ML algorithms to predict attendance.
+
+# Match data
+
+Match data is sourced from the AFL website via the fitzRoy package. This data includes a number of
+useful features such as the teams playing, the venue, time and day of match and the weather. This
+is a sample of the data available using a round from 2019:
+
+```{r match_example}
+fitzRoy::fetch_results(season = 2019, round = 1)
+```
+
+However, this data does not include the attendance.
+
+## Load all match data
+
+Match data will be loaded for all seasons from 2010 to 2022.
+
+```{r load_all_matches}
+seasons <- 2010:2022
+
+season_data <- map(seasons, ~ fetch_results_afl(season = .x))
+```
+
+It turns out that data is only available from 2014 onwards.
+
+```{r match_data}
+all_matches <- bind_rows(season_data)
+
+tidy_matches <- all_matches %>%
+  mutate(
+    # match.date is in UTC. Local time is more useful for modelling
+    date = map2_vec(match.date, venue.timeZone, ~ with_tz(.x, .y)),
+    venue = venue.name,
+    home_team = match.homeTeam.name,
+    away_team = match.awayTeam.name,
+    .keep = "none"
+  )
+
+tidy_matches %>%
+  slice_head(n = 10)
+```
+
+
+# Attendance data
+
+AFL Tables provides a big list of attendances for all matches in AFL history. This contains the crowd, date and teams playing.
+
+```{r load_attendance}
+# GET request to load data
+attendance_path <- "https://afltables.com/afl/stats/biglists/bg7.txt"
+attendance_req <- httr::GET(attendance_path)
+httr::stop_for_status(attendance_req)
+
+# Get content as text
+attendance_data <- httr::content(attendance_req, as = "text", encoding = "UTF-8")
+# Parse as fixed width file
+skip <- 2
+attendance_positions <- fwf_empty(
+  attendance_data,
+  skip = skip,
+  col_names = c(
+    "rank",
+    "crowd",
+    "home_team",
+    "home_score",
+    "away_team",
+    "away_score",
+    "venue",
+    "date"
+  ),
+  n = 500
+)
+# Load and tidy attendance data
+attendance <- read_fwf(
+  attendance_data,
+  col_positions = attendance_positions,
+  skip = skip,
+  col_select = c(crowd, home_team, away_team, venue, date)
+) |>
+  mutate(
+    date = dmy(date),
+    # Discard non-numeric data from crowd
+    crowd = as.numeric(gsub("[^0-9]", "", crowd))
+  )
+
+attendance %>%
+  slice_max(crowd, n = 10)
+```
+
+
+# Join attendance and match data
+
+There is no common identifier between the match and attendance
+data, so the data will be joined using the date of the match and the teams playing.
+The venue could also be used for matching, but as two teams should never be
+playing each other on the same day it shouldn't be necessary.
+
+Firstly check that the team names are consistent between the two data sets.
+
+```{r team_names_check}
+team_names_match <- unique(c(tidy_matches$home_team, tidy_matches$away_team))
+team_names_attendance <- unique(c(attendance$home_team, attendance$away_team))
+
+setdiff(team_names_match, team_names_attendance)
+```
+
+These teams are missing in the attendance data. Recode the attendance data to
+use these names.
+
+Note that the attendance data includes additional teams that were active in the AFL before the match data period e.g. Fitzroy, University.
+
+```{r team_names_recode}
+attendance_recoded <- attendance |>
+  mutate(
+    across(
+      c(home_team, away_team),
+      ~ case_match(
+        .x,
+        "GW Sydney" ~ "GWS Giants",
+        "Gold Coast" ~ "Gold Coast Suns",
+        "Geelong" ~ "Geelong Cats",
+        "West Coast" ~ "West Coast Eagles",
+        "Sydney" ~ "Sydney Swans",
+        "Adelaide" ~ "Adelaide Crows",
+        .default = .x
+      )
+    )
+  ) |>
+  select(-venue)
+```
+
+
+Join the data using left join to identify matches that are missing attendance data.
+
+```{r join_data}
+matched_data <- tidy_matches |>
+  mutate(
+    date_only = date(date)
+  ) |>
+  left_join(attendance_recoded, by = c("date_only" = "date", "home_team", "away_team"))
+
+# Find any unmatched matches
+matched_data |>
+  filter(is.na(crowd))
+```
+
+The only unmatched matched is the 2015 Grand Final. This is because the
+order of the home and away teams is different in the attendance data.
+
+To overcome this, both datasets will have a computed join column added
+which contains both teams in alphabetical order.
+
+```{r join_column}
+create_join_key <- function(home, away) {
+  teams <- c(home, away)
+  paste0(sort(tolower(teams)), collapse = "_")
+}
+
+tidy_matches <- tidy_matches |>
+  mutate(
+    join_key = map2_chr(home_team, away_team, create_join_key)
+  )
+
+attendance_recoded <- attendance_recoded |>
+  mutate(
+    join_key = map2_chr(home_team, away_team, create_join_key)
+  )
+```
