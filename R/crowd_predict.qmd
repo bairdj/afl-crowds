@@ -4,6 +4,7 @@ author: James Baird
 format:
   html:
     df-print: kable
+    toc: true
 ---
 ```{r setup, include=FALSE}
 library(dplyr)
@@ -11,6 +12,34 @@ library(fitzRoy)
 library(readr)
 library(lubridate)
 library(purrr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+library(tidymodels)
+library(slider)
+
+
+theme_crowd <- function() {
+    theme_minimal() +
+    theme(
+      axis.line = element_line(color = "black"),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14, face = "bold"),
+      plot.title = element_text(size = 18, face = "bold", hjust = 0.5),
+      panel.grid.major.y = element_line(color = "gray70"),
+      panel.grid.minor = element_blank(),
+      panel.grid.major = element_blank(),
+      panel.border = element_blank(),
+      panel.background = element_blank(),
+      legend.position = "bottom",
+      legend.title = element_text(size = 14, face = "bold"),
+      legend.text = element_text(size = 12),
+      legend.background = element_blank(),
+      plot.margin = unit(c(1, 1, 0.5, 0.5), "cm")
+    )
+}
+
+palette <- c("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728")
 ```
 
 
@@ -33,30 +62,41 @@ However, this data does not include the attendance.
 
 ## Load all match data
 
-Match data will be loaded for all seasons from 2010 to 2022.
+Match data will be loaded for all seasons from 2014 to 2022 (match data from the AFL site is not available prior to 2014). Finals matches will be excluded.
 
-```{r load_all_matches}
-seasons <- 2010:2022
+```{r load_all_matches, message = FALSE}
+seasons <- 2014:2022
 
-season_data <- map(seasons, ~ fetch_results_afl(season = .x))
-```
+season_data <- map(seasons, ~ fetch_results_afl(season = .x), .progress = TRUE)
 
-It turns out that data is only available from 2014 onwards.
-
-```{r match_data}
 all_matches <- bind_rows(season_data)
 
-tidy_matches <- all_matches %>%
+tidy_matches <- all_matches |>
+  filter(!round.abbreviation %in% c("FW1", "SF", "PF", "GF")) |>
   mutate(
     # match.date is in UTC. Local time is more useful for modelling
-    date = map2_vec(match.date, venue.timeZone, ~ with_tz(.x, .y)),
+    # Use in list as can't have multiple TZ in one vector
+    date_time = map2(match.date, venue.timeZone, ~ with_tz(.x, .y)),
+    date = map_vec(date_time, date),
+    day_of_week = map_chr(date_time, ~ as.character(wday(.x, label = TRUE))),
+    start_hour = map_int(date_time, ~ hour(.x)),
+    month = map_int(date_time, ~ month(.x)),
     venue = venue.name,
     home_team = match.homeTeam.name,
     away_team = match.awayTeam.name,
+    season = round.year,
+    round = str_match(round.abbreviation, "^Rd ([0-9]+)$")[, 2] |> as.numeric(),
+    temperature = weather.tempInCelsius,
+    rain = weather.weatherType %in% c("THUNDERSTORMS", "RAIN"),
+    winner = case_when(
+      homeTeamScore.matchScore.totalScore > awayTeamScore.matchScore.totalScore ~ "home",
+      homeTeamScore.matchScore.totalScore < awayTeamScore.matchScore.totalScore ~ "away",
+      TRUE ~ "draw"
+    ),
     .keep = "none"
   )
 
-tidy_matches %>%
+tidy_matches |>
   slice_head(n = 10)
 ```
 
@@ -103,7 +143,7 @@ attendance <- read_fwf(
     crowd = as.numeric(gsub("[^0-9]", "", crowd))
   )
 
-attendance %>%
+attendance |>
   slice_max(crowd, n = 10)
 ```
 
@@ -145,8 +185,7 @@ attendance_recoded <- attendance |>
         .default = .x
       )
     )
-  ) |>
-  select(-venue)
+  )
 ```
 
 
@@ -185,4 +224,745 @@ attendance_recoded <- attendance_recoded |>
   mutate(
     join_key = map2_chr(home_team, away_team, create_join_key)
   )
+
+# Use the generic venue name from the attendance data
+# rather than the commercial name in the match data
+matched_data <- tidy_matches |>
+  select(-venue) |>
+  left_join(select(attendance_recoded, date, join_key, crowd, venue), by = c("date", "join_key"))
+
 ```
+
+# Exploratory analysis
+
+```{r plot_functions, include = FALSE}
+boxplot_crowd <- function(df, strata) {
+  df |>
+    ggplot(aes(x = {{strata}}, y = crowd)) +
+    geom_boxplot(fill = palette[[1]]) +
+    coord_flip() +
+    theme_crowd() +
+    theme(
+      panel.grid.major.y = element_blank(),
+      panel.grid.major.x = element_line(colour = "grey", linetype = "dashed"),
+      axis.line.y = element_blank()
+    ) +
+    scale_y_continuous(expand = expansion(.02, .05), labels = scales::comma, limits = c(0, NA))
+}
+```
+
+```{r crowd_distribution}
+matched_data |>
+  ggplot(aes(x = crowd)) +
+  geom_histogram(fill = palette[[1]], binwidth = 5000) +
+  theme_crowd() +
+  labs(
+    x = "Crowd",
+    y = "Matches",
+    title = "Crowd distribution"
+  ) +
+  scale_x_continuous(expand = c(0, 0), labels = scales::comma) +
+  scale_y_continuous(expand = expansion(c(0, .05)))
+```
+
+As expected, the distribution is skewed to the right.
+
+Interestingly, a large number of matches have a crowd of 0. These are likely
+matches that were played in 2020 when crowds were not allowed due to the
+COVID-19 pandemic, rather than missing data.
+
+```{r zero_crowds}
+matched_data |>
+  filter(crowd == 0) |>
+  count(season = year(date))
+```
+
+The 2021 season also had matches with no crowds.
+
+Although the 2020 and 2021 seasons had some matches with crowds, it is likely
+these were played in front of smaller than normal crowds due to social distancing requirements, the lack of interstate travel and people being reluctant to attend matches. Thus, these seasons will be excluded from the analysis.
+
+```{r exclude_2020_2021}
+eda_data <- matched_data |>
+  filter(!season %in% c(2020, 2021))
+```
+
+## Crowds by venue
+
+```{r crowds_by_venue}
+eda_data |>
+  boxplot_crowd(venue) +
+  labs(
+    x = NULL,
+    y = "Crowd",
+    title = "Crowds by venue"
+  )
+```
+
+As expected, the larger stadiums generally have larger crowds.
+
+## Crowds by season
+
+```{r crowds_by_season}
+eda_data |>
+  ggplot(aes(x = season, y = crowd)) +
+  geom_boxplot(fill = palette[[1]]) +
+  theme_crowd() +
+  scale_y_continuous(expand = expansion(0, .05), labels = scales::comma, limits = c(0, NA)) +
+  labs(
+    x = "Season",
+    y = "Crowd",
+    title = "Crowds by season"
+  )
+```
+
+The plot shows that crowd sizes increased slightly over time from 2014 to 2019, but that crowds in the first post-COVID season in 2022 were much smaller.
+
+## Crowds by team
+
+### Crowds by home team
+
+```{r crowds_by_home_team}
+eda_data |>
+  boxplot_crowd(home_team) +
+  labs(
+    x = NULL,
+    y = "Crowd",
+    title = "Crowds by home team"
+  )
+```
+
+The plot shows clear differences in the crowd sizes attracted by each team.
+
+### Crowds by any team
+
+To give a better indication of the crowds drawn by each team, I have
+included all regular season matches that a club participated in, regardless
+of whether they were the home or away team.
+
+```{r crowds_by_any_team}
+eda_data |>
+  select(home_team, away_team, crowd) |>
+  pivot_longer(
+    cols = c(home_team, away_team),
+    names_to = "team_type",
+    values_to = "team"
+  ) |>
+  boxplot_crowd(team) +
+  labs(
+    x = NULL,
+    y = "Crowd",
+    title = "Crowds by team"
+  )
+```
+
+## Crowds by time slot
+
+It is likely that there are differences in the crowds attracted by matches
+played at different times of the day.
+
+```{r time_of_day}
+eda_data |>
+  mutate(
+    start_hour = factor(start_hour, levels = min(start_hour):max(start_hour))
+  ) |>
+  boxplot_crowd(start_hour) +
+  labs(
+    x = NULL,
+    y = "Crowd",
+    title = "Crowds by hour of match start"
+  ) +
+  scale_x_discrete(labels = ~ paste0(.x, ":00"))
+```
+
+
+### Comparison of Saturday and Sunday crowds by time
+
+```{r time_of_day_weekend}
+eda_data |>
+  mutate(
+    start_hour = factor(start_hour)
+  ) |>
+  filter(day_of_week %in% c("Sat", "Sun")) |>
+  mutate(
+    day_of_week = forcats::fct_relevel(day_of_week, "Sat", "Sun")
+  ) |>
+  ggplot(aes(x = start_hour, y = crowd, fill = day_of_week)) +
+  geom_boxplot() +
+  scale_fill_manual(values = palette) +
+  theme_crowd() +
+  labs(
+    x = "Hour of match start",
+    y = "Crowd",
+    title = "Difference between Saturday and Sunday crowds by time"
+  )
+```
+
+## Weather
+
+### Crowds by temperature
+
+```{r crowds_by_temperature}
+eda_data |>
+  ggplot(aes(x = temperature, y = crowd)) +
+  geom_jitter(alpha = .5, colour = palette[1]) +
+  theme_crowd() +
+  labs(
+    x = "Temperature (°C)",
+    y = "Crowd",
+    title = "Crowds by temperature"
+  )
+```
+
+There does not appear to be any obvious relationship between temperature and crowd size. There is a suspiciously high number of matches with a temperature around 18.
+
+```{r temperature_18}
+eda_data |>
+  ggplot(aes(x = temperature)) +
+  geom_histogram(binwidth = 1, fill = palette[1]) +
+  theme_crowd() +
+  labs(
+    x = "Temperature (°C)",
+    y = "Count",
+    title = "Temperature distribution"
+  ) +
+  scale_y_continuous(expand = expansion(0, .05), labels = scales::comma) +
+  scale_x_continuous(breaks = ~ seq(0, .x[2], 1))
+```
+
+The histogram confirms that there are a huge number of matches with a temperature of
+18. This may have been used as a default value when the temperature data was missing.
+Given that there is no obvious pattern anyway, I will ignore the temperature data.
+
+
+### Rain
+
+```{r rain}
+eda_data |>
+  mutate(rain = factor(rain, levels = c(FALSE, TRUE), labels = c("No rain", "Raining"))) |>
+  boxplot_crowd(rain) +
+  labs(
+    x = NULL,
+    y = "Crowd",
+    title = "Crowds by rain"
+  )
+```
+
+It appears that crowds are slightly smaller when it is raining.
+
+
+## By round
+
+```{r crowds_by_round}
+eda_data |>
+  mutate(round = factor(round)) |>
+  boxplot_crowd(round) +
+  labs(
+    x = "Round",
+    y = "Crowd",
+    title = "Crowds by round"
+  )
+```
+# Modelling
+
+For modelling, years 2014 to 2019 will be used as the training data and
+2022 will be used as the test data.
+
+As seen in the exploratory analysis, crowds in 2022 were lower than previous
+years, so it is likely that the model will over-predict crowds in 2022 as
+they are from a different distribution.
+
+The metric used for comparison will be the root mean squared error (RMSE).
+This is sensitive to outliers, which is appropriate for this data
+as the crowd sizes are skewed to the right.
+
+```{r split_data}
+train_data <- matched_data |>
+  filter(season < 2020)
+
+test_data <- matched_data |>
+  filter(season == 2022)
+```
+
+## Null model
+
+```{r null_model}
+
+null_model <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression") |>
+  fit(crowd ~ 1, data = train_data)
+
+null_rmse <- null_model |>
+  augment(test_data) |>
+  rmse(crowd, .pred) |>
+  pull(.estimate)
+
+null_rmse
+```
+
+The RMSE for the null model is `r null_rmse`.
+
+## Basic models
+
+As a basic model, I will fit a linear regression model with features for the teams,
+the venue, time of day, day of week and round.
+
+I will include separate features for the home
+and away teams, although another approach would be to use flag variables
+to indicate whether a team is participating in the match. This would better
+reflect the fact that teams may play away games at their home ground, especially
+in Melbourne. However, many members only have tickets for home games, so it
+may be relevant to specifically track the home team.
+
+
+```{r basic_lm}
+
+linear_model <- linear_reg() |>
+  set_engine("lm") |>
+  set_mode("regression") |>
+  fit(crowd ~
+        home_team + away_team +
+        venue + factor(day_of_week) + round,
+      data = train_data)
+
+linear_rmse <- linear_model |>
+  augment(new_data = test_data) |>
+  rmse(crowd, .pred) |>
+  pull(.estimate)
+
+linear_rmse
+```
+
+The RMSE for the basic model is `r linear_rmse`, an improvement over the null model.
+
+```{r lm_summary}
+tidy(linear_model)
+```
+
+Examining the coefficients of this basic model, the venue has a clear effect on the
+crowd size as expected.
+
+The magnitude of the home team coefficients are much higher than the away team coefficients, suggesting that the home team is a stronger predictor of crowd size than the away team. When looking at the away team coefficients, most non-Victorian teams
+have a negative coefficient, which reflects that when these teams play away it is
+usually interstate, and their fans are unlikely to travel.
+
+It is worth noting that there will be collinearity that is not accounted for in this
+model. For example, Brisbane is always the home team at the Gabba.
+
+The matches played on Monday, Tuesday and Wednesday, all non-traditional timeslots,
+have much higher crowds than the other days of the week. This is almost certainly
+due to these matches being special occasions like ANZAC Day or the Queen's Birthday,
+which always draw big crowds. It may be possible to improve the model by including
+a flag for special occasion matches.
+
+### Other basic models
+
+Using the same predictors, I will fit some other models to compare with the
+linear regression model.
+
+These models do not have any tuning performed,
+so it is possible that they can be further improved by tuning.
+
+```{r other_basic_models}
+set.seed(0xAF)
+# Recipe to tidy data using the above features only
+basic_recipe <- recipe(crowd ~ home_team + away_team + venue + day_of_week + round, data = train_data) |>
+  step_dummy(all_nominal_predictors())
+
+basic_models <- list(
+  rf = rand_forest("regression") |> set_engine("ranger"),
+  xgb = boost_tree("regression") |> set_engine("xgboost"),
+  decision_tree = decision_tree("regression") |> set_engine("rpart")
+)
+
+basic_fit <- map(basic_models, function(model) {
+  workflow() |>
+    add_recipe(basic_recipe) |>
+    add_model(model) |>
+    fit(data = train_data)
+})
+
+map_dbl(basic_fit, function(model) {
+  model |>
+    augment(test_data) |>
+    rmse(crowd, .pred) |>
+    pull(.estimate)
+})
+
+```
+
+These models show marginal improvements over both the linear models.
+The decision tree model does not show improvement, however it allows for a basic
+visualisation of the tree-based models.
+
+
+```{r tree_plot}
+basic_fit$decision_tree |>
+  extract_fit_engine() |>
+  rpart.plot::rpart.plot()
+```
+
+Although the basic decision tree does not necessarily generalise well, it does
+allow some broad insight into the non-linear aspects of the model:
+
+* GWS and Gold Coast games always have small crowds
+* Perth Stadium always has the same crowd size predicted - possibly because it
+  always draws large crowds near capacity. Other venues with static predictions
+  are York Park, Bellerive Oval, Docklands and Kardinia Park.
+* Bulldogs home games away from Docklands are always small. This is because these
+  are in Ballarat, but the model has used the combination of Bulldogs home + not Docklands
+  as a proxy rather than the specific Ballarat venue.
+* MCG matches are treated separately to other venues, probably because its capacity is so much
+  larger. Notably, Melbourne home games are predicted to be much smaller than other clubs.
+
+
+### Residuals
+
+It is worth looking at the residuals of the model to see if there are any patterns.
+
+Using the random forest model, the top 15 under-predicted matches are:
+
+```{r under_predicted}
+basic_fit$rf |>
+  augment(train_data) |>
+  mutate(residual = .pred - crowd) |>
+  slice_min(residual, n = 15) |>
+  select(date, home_team, away_team, venue, round, day_of_week, crowd, .pred, residual)
+```
+
+The top 15 over-predicted matches are:
+
+```{r over_predicted}
+basic_fit$rf |>
+  augment(train_data) |>
+  mutate(residual = .pred - crowd) |>
+  slice_max(residual, n = 15) |>
+  select(date, home_team, away_team, venue, round, crowd, .pred, residual)
+```
+
+There are a few patterns here:
+
+* All of the residuals are at the MCG. This likely reflects the huge variability
+  in crowd size due to its large capacity and shared use between teams.
+* Over-prediction is generally when interstate teams are playing at the MCG.
+* Under-prediction is generally for traditional blockbusters between the big Victorian teams
+  e.g. Richmond, Collingwood, Essendon, Richmond.
+
+It may be worth adding a feature for whether the match is between two teams from different
+states. A feature could also be added for whether the match is a "blockbuster", but this
+seems a bit subjective.
+
+## Adding more features
+
+### Form
+
+All the features so far are essentially based on team popularity, match timeslot and team popularity.
+It does not take into account form, which is likely to have some effect on crowd size. This may be
+because if a team is winning a lot, their fans may be more inclined to attend games. Additionally,
+if two in-form teams are playing, it may attract more neutral fans. Conversely, if a top team is 
+playing a poor team, or two poor teams are playing each other, the match may be less attractive to
+fans.
+
+To do this, I will create features for the number of wins a team has had in its last 4, 8 and 12 games.
+Draws will count as 0.5 wins. This is done by match date. Form is carried across seasons.
+
+The features are shifted forward by 1 row so that the features for a match are based on the previous
+games, not the current game. This means that the first round of the season will not have any form features.
+
+```{r form_features}
+team_form <- matched_data |>
+  select(date, home_team, away_team, winner) |>
+  pivot_longer(cols = c(home_team, away_team), names_to = "team_type", values_to = "team") |>
+  mutate(wins = case_when(
+    winner == "draw" ~ 0.5,
+    team_type == "home_team" & winner == "home" ~ 1,
+    team_type == "away_team" & winner == "away" ~ 1,
+    TRUE ~ 0
+  )) |>
+  select(date, team, wins) |>
+  arrange(date) |>
+  mutate(
+    form_4 = slide_sum(wins, before = 3),
+    form_8 = slide_sum(wins, before = 7),
+    form_12 = slide_sum(wins, before = 11),
+    # Shift the form features forward by 1 row to avoid data leakage
+    # i.e. the form features for a match are based on the previous games
+    across(starts_with("form"), ~lag(.x, 1)),
+    .by = team
+  ) |>
+  select(date, team, starts_with("form"))
+
+# Show example of form features
+team_form |>
+  filter(!is.na(form_4), team == "Western Bulldogs") |>
+  slice_max(date, n = 5)
+```
+
+These features will be joined back to the main dataset, and a form differential feature will be created.
+
+### Public holidays
+
+I will create flag variables for matches which are on public holidays in Victoria.
+
+The holidays to consider:
+* ANZAC Day (25 April)
+* Good Friday
+* Easter Monday
+* Queen's Birthday (second Monday in June)
+* Labour Day (second Monday in March)
+
+```{r public_holidays}
+nth_wday_in_month <- function(year, month, wday, n) {
+  current_date <- make_date(year, month, 1)
+  n_count <- 0
+  while (TRUE) {
+    if (wday(current_date) == wday) {
+      n_count <- n_count + 1
+      if (n_count == n) {
+        return(current_date)
+      }
+    }
+    current_date <- current_date + days(1)
+  }
+}
+
+
+# Get all years to calculate holidays for
+years <- unique(year(matched_data$date))
+
+holidays <- list()
+
+holidays$anzac_day <- make_date(years, 4, 25)
+holidays$queens_birthday <- map_vec(years, ~ nth_wday_in_month(.x, 6, 2, 2))
+holidays$labour_day <- map_vec(years, ~ nth_wday_in_month(.x, 3, 2, 2))
+holidays$good_friday <- as.Date(timeDate::GoodFriday(years))
+holidays$easter_monday <- as.Date(timeDate::EasterMonday(years))
+
+# Collapse all into data frame
+public_holidays <- map(holidays, ~ list(date = .x)) |>
+  bind_rows(.id = "public_holiday")
+```
+
+### Interstate matches
+
+I will define the home state for each team. From this, I can create a feature
+for whether the match is between two teams from different states.
+
+Additionally, I will assign a state to each venue in the dataset. I can then
+use this as a feature for the number of teams playing in their home state.
+This is relevant for when a team plays a home game outside of their home state,
+e.g. a Victorian team playing a home game in Tasmania.
+
+```{r states}
+state_map <- c(
+  "Adelaide Crows" = "SA",
+  "Brisbane Lions" = "QLD",
+  "Carlton" = "VIC",
+  "Collingwood" = "VIC",
+  "Essendon" = "VIC",
+  "Fremantle" = "WA",
+  "GWS Giants" = "NSW",
+  "Geelong Cats" = "VIC",
+  "Gold Coast Suns" = "QLD",
+  "Hawthorn" = "VIC",
+  "Melbourne" = "VIC",
+  "North Melbourne" = "VIC",
+  "Port Adelaide" = "SA",
+  "Richmond" = "VIC",
+  "St Kilda" = "VIC",
+  "Sydney Swans" = "NSW",
+  "West Coast Eagles" = "WA",
+  "Western Bulldogs" = "VIC"
+)
+
+venue_state_map <- c(
+  "Adelaide Oval" = "SA",
+  "Bellerive Oval" = "TAS",
+  "Carrara" = "QLD",
+  "Cazaly's Stadium" = "QLD",
+  "Docklands" = "VIC",
+  "Eureka Stadium" = "VIC",
+  "Gabba" = "QLD",
+  "Jiangwan Stadium" = "China",
+  "Kardinia Park" = "VIC",
+  "M.C.G." = "VIC",
+  # Set Manuka to NSW as encloses ACT and Canberra is second home for GWS
+  "Manuka Oval" = "NSW",
+  "Marrara Oval" = "NT",
+  "Perth Stadium" = "WA",
+  "Riverway Stadium" = "QLD",
+  "S.C.G." = "NSW",
+  "Stadium Australia" = "NSW",
+  "Subiaco" = "WA",
+  "Sydney Showground" = "NSW",
+  "Traeger Park" = "NT",
+  "Wellington" = "NZ",
+  "York Park" = "TAS"
+)
+
+```
+
+## Fit new models with expanded dataset
+
+```{r new_dataset}
+home_team_form <- team_form |>
+  rename_with(~paste0("home_", .x), c(everything(), -date))
+
+away_team_form <- team_form |>
+  rename_with(~paste0("away_", .x), c(everything(), -date))
+
+expanded_data <- matched_data |>
+  left_join(home_team_form, by = c("date", "home_team")) |>
+  left_join(away_team_form, by = c("date", "away_team")) |>
+  left_join(public_holidays, by = "date") |>
+  mutate(
+    home_state = state_map[home_team],
+    away_state = state_map[away_team],
+    interstate_match = home_state != away_state,
+    venue_state = venue_state_map[venue],
+    n_teams_home_state = case_when(
+      home_state == venue_state & away_state == venue_state ~ 2,
+      home_state == venue_state | away_state == venue_state ~ 1,
+      TRUE ~ 0
+    ),
+    mean_form_4 = (home_form_4 + away_form_4) / 2,
+    mean_form_8 = (home_form_8 + away_form_8) / 2,
+    mean_form_12 = (home_form_12 + away_form_12) / 2,
+    form_4_diff = abs(home_form_4 - away_form_4),
+    form_8_diff = abs(home_form_8 - away_form_8),
+    form_12_diff = abs(home_form_12 - away_form_12),
+    public_holiday = forcats::fct_relevel(coalesce(public_holiday, "none"), "none"),
+    across(where(is.logical), ~ ifelse(.x, 1, 0)),
+    round = as.factor(round)
+  ) |>
+  select(-date_time)
+
+expanded_data |>
+  slice_max(date, n = 5, with_ties = FALSE)
+```
+
+
+### Create train and test sets
+
+I will use the same testing and training methodology as before,
+with seasons 2014 to 2019 as the training data and 2022 as the test data.
+
+I will also use 5-fold cross validation on the training data to tune the models.
+
+Note that there will be a small amount of missing data in the first few matches
+in the dataset due to the time it takes to build up the form features. These
+will be discarded.
+
+```{r train_test}
+expanded_train <- expanded_data |>
+  drop_na() |>
+  filter(season < 2020)
+
+expanded_folds <- vfold_cv(expanded_train, v = 5)
+
+expanded_test <- expanded_data |>
+  filter(season == 2022)
+
+expanded_split <- make_splits(expanded_train, expanded_test)
+```
+
+
+### Fit models
+
+I will use the `recipes` package to create a preprocessing recipe for the
+data. This will convert all nominal predictors to dummy variables and
+remove any predictors with zero variance.
+
+I will train a series of models on the cross-validation folds, and then
+use the best model to predict the test data.
+
+I will evaluate the tuned models using RMSE.
+
+```{r fit_models, message = FALSE, warning = FALSE}
+expanded_recipe <- recipe(crowd ~ ., data = expanded_train) |>
+  # Remove non-predictor columns
+  update_role(date, season, join_key, winner, new_role = "other") |>
+  step_dummy(all_nominal_predictors()) |>
+  step_zv(all_predictors())
+
+# Create a series of tunable models
+models <- list(
+  xgb = boost_tree("regression", mtry = tune(), trees = tune()),
+  rf = rand_forest("regression", mtry = tune()),
+  plr = linear_reg("regression", penalty = tune(), mixture = tune()) |>
+    set_engine("glmnet"),
+  mars = mars("regression")
+)
+
+wf_set <-
+  workflow_set(
+    preproc = list(standard = expanded_recipe),
+    models = models,
+    cross = TRUE
+  )
+
+model_results <- workflow_map(wf_set, resamples = expanded_folds)
+
+```
+
+This shows the best performing tuned models by RMSE.
+
+```{r rmse_best}
+autoplot(
+  model_results,
+  rank_metric = "rmse",
+  metric = "rmse"
+)
+```
+
+It is clear that the XGBoost model is the best performing.
+I will extract the best parameters and finalise the model using
+these. This shows the mtry and trees parameters that gave the
+best results.
+
+```{r best_model}
+best_results <- model_results |>
+  extract_workflow_set_result("standard_xgb") |>
+  select_best(metric = "rmse")
+
+final_model <- model_results |>
+  extract_workflow("standard_xgb") |>
+  finalize_workflow(best_results)
+
+best_results
+```
+
+I will now collect the predictions from the best model for the
+2022 season.
+
+```{r evaluate_2022}
+final_results <- final_model |>
+  last_fit(split = expanded_split)
+
+collect_metrics(final_results) |>
+  filter(.metric == "rmse")
+```
+
+Note that the RMSE in the cross-validation is quite a bit lower
+than when evaluated on the test data. This would typically indicate
+overfitting, but in this case it is more likely due to the fact
+that the 2022 season is from a different distribution to the
+training data.
+
+```{r plot_predictions}
+final_results |>
+  collect_predictions() |>
+  ggplot(aes(x = crowd, y = .pred)) +
+  geom_point(alpha = 0.5, colour = palette[1]) +
+  theme_crowd() +
+  coord_obs_pred() +
+  geom_abline(colour = "gray50", lty = 2) +
+  labs(
+    x = "Observed crowd",
+    y = "Predicted crowd"
+  )
+```
+
+As expected, the plot of observed vs predicted crowds shows
+that the model tends to over-predict.
