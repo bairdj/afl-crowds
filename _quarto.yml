@@ -1,0 +1,19 @@
+project:
+  type: website
+
+execute:
+  freeze: auto
+
+website:
+  title: James Baird
+  sidebar:
+    style: docked
+    tools:
+      - icon: github
+        href: https://github.com/bairdj
+      - icon: linkedin
+        href: https://www.linkedin.com/in/james-baird-data
+    contents:
+      - section: "Analyses"
+        contents:
+          - analyses/crowd_predict.qmd
