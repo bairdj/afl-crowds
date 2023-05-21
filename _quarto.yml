@@ -17,3 +17,7 @@ website:
       - section: "Analyses"
         contents:
           - analyses/crowd_predict.qmd
+
+format:
+  html:
+    theme: cosmo
